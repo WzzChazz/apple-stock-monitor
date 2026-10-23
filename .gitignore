@@ -1,0 +1,22 @@
+# 机密和个人数据：绝不提交
+.env
+.apple-profile/
+profiles/
+accounts.json
+proxies.txt
+runs/
+_backup/
+
+# 运行时文件
+*.log
+events.jsonl
+trigger.json
+trigger.tmp
+monitor.pid
+ordered.lock
+
+# 本地环境
+__pycache__/
+.idea/
+.vscode/
+.DS_Store
