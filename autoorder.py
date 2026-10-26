@@ -12,6 +12,8 @@
   python3 autoorder.py serve                                     # 演练：走到「立即下单」前停住
   python3 autoorder.py serve --live                              # 正式：真下单，成功一次就写 ordered.lock 不再下第二单
   python3 autoorder.py serve --parts MDGD4PA/A --selftest R448   # 用连接线假装王府井有货，演练一遍就退出
+每次抢完不管成没成都会推送结果和各步耗时（慢了一步 / 卡在哪一步），记在 attempts.jsonl；没抢成但信号还新鲜会马上再试一次。
+站位放的型号默认按 events.jsonl 挑最近 7 天补货最多的。看补货规律和抢购记录：python3 stats.py
 
 取货人等信息写在同目录 .env（登录后账户里已有的会直接用，这里只用来补空着的项）：
   ORDER_LAST_NAME / ORDER_FIRST_NAME   取货人姓、名（要和到店出示的证件一致）
@@ -24,12 +26,13 @@
 """
 import argparse
 import asyncio
+import collections
 import json
 import os
 import re
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from playwright.async_api import async_playwright
@@ -39,6 +42,8 @@ PROFILE = HERE / ".apple-profile"
 RUNS = HERE / "runs"
 TRIGGER = HERE / "trigger.json"    # monitor.py 发现有货时写入：{"ts": 时间戳, "avail": [[门店, 型号], ...]}
 LOCK = HERE / "ordered.lock"       # 下单成功后写入，之后拒绝再跑，保证只下一单
+EVENTS = HERE / "events.jsonl"     # monitor.py 记的有货/售罄，用来挑站位型号
+ATTEMPTS = HERE / "attempts.jsonl"  # 每次抢购的结果和各步耗时，stats.py 汇总
 REPOSITION_EVERY = 15 * 60         # 结账会话约 20 分钟就过期（实测，刷新页面续不上），提前重新进一次结账
 BASE = "https://www.apple.com.cn"
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -49,8 +54,10 @@ PART_NAMES = {"MK2M4CH/A": "256GB 星光白色", "MK2N4CH/A": "256GB 夜空色",
               "MK2P4CH/A": "512GB 星光白色", "MK2Q4CH/A": "512GB 夜空色",
               "MK2T4CH/A": "1TB 星光白色", "MK2U4CH/A": "1TB 夜空色",
               "MK2V4CH/A": "2TB 星光白色", "MK2W4CH/A": "2TB 夜空色"}
-# 站位时购物袋里默认放的型号：10-23 北京补货 40 次里它占 11 次，最多，也最便宜
+# 没有 events.jsonl 记录时站位放的型号（10-23 北京补货 40 次里它占 11 次，最多，也最便宜）；
+# 有记录就自动挑最近 7 天补货最多的，见 most_restocked()
 DEFAULT_PREFER = "MK2M4CH/A"
+STEP_NAMES = {"Fulfillment": "取货方式", "PickupContact": "取货人", "Billing": "付款方式", "Review": "检查订单"}
 # 测试模式下碰到这些字样的按钮一律不点
 SUBMIT_WORDS = ("提交订单", "立即下单", "下单", "确认支付", "立即付款", "去付款", "Place")
 
@@ -113,7 +120,11 @@ class Run:
         self.n = 0
         self.inflight = {}    # 页面上还没回来的 Apple 接口请求 -> 发出时间（watch_checkout_api 记）
         self.api_at = 0.0     # 最近一次有接口请求发出或回来的时间
+        self.sent = collections.deque(maxlen=200)  # 最近发出的接口请求 (时间, URL)，press() 用来确认点上了
         self.saving = set()   # 后台还没存完的页面
+        self.t_hit = None     # 开抢时间，下面各步耗时从这里算
+        self.marks = []       # [(走到哪一步, 开抢后秒数), ...]
+        self.pick = None      # 这次抢的门店
 
     def log(self, msg):
         line = f"[{time.time() - self.t0:6.1f}s] {msg}"
@@ -143,6 +154,25 @@ class Run:
         """等后台存的页面都写完"""
         if self.saving:
             await asyncio.wait(self.saving, timeout=15)
+
+    def mark(self, what):
+        """记下抢购走到了哪一步（开抢后第几秒），没抢成时一眼看出慢在哪、卡在哪"""
+        if self.t_hit:
+            self.marks.append((what, round(time.time() - self.t_hit, 1)))
+
+    def timeline(self):
+        return " → ".join(f"{w} {s}s" for w, s in self.marks) or "还没开始"
+
+    async def moved_on(self, before, since, timeout):
+        """点完「继续」后等页面离开 before 这个 URL。接口都回来 3 秒了还停在原地，多半是被 Apple 拒了
+        （刚好没货、表单报错之类），返回 False，不再干等到超时"""
+        end = time.time() + timeout
+        while self.page.url == before:
+            busy = any(t >= since - 1 for t in self.inflight.values())
+            if time.time() > end or (not busy and time.time() - max(self.api_at, since) > 3):
+                return False
+            await asyncio.sleep(0.1)
+        return True
 
     async def settle(self, quiet=0.3, timeout=5):
         """代替固定干等：等页面发出去的 Apple 接口请求都回来、再安静 quiet 秒。刚点完按钮请求可能还没发出去，
@@ -176,6 +206,41 @@ class Run:
                 raise
             await locator.dispatch_event("click")  # 还被别的元素挡着，就直接派发点击事件
         self.log(f"点击 {what}「{text[:30]}」")
+
+
+def is_api(r):
+    """页面发给 Apple 商店的接口请求（不算图片、脚本这些静态资源）"""
+    u = r.url
+    return "/shop/" in u and (r.resource_type in ("xhr", "fetch") or "/shop/checkout" in u or "/shop/bagx" in u)
+
+
+def is_search(url):
+    """「按位置查各店库存」的接口"""
+    return "storeLocator" in url and "_a=search" in url
+
+
+async def press(run, locator, what, expect, shown=None, every=0.5, tries=10):
+    """点一个会发 Apple 接口的按钮，并确认页面真有反应：发出了 expect(url) 匹配的请求、页面跳走了，或者 shown 出现了。
+    页面刚打开时脚本可能还没接管按钮，点了没反应，就隔 every 秒再点；按钮变灰/不见了说明在处理，就不再点"""
+    page = run.page
+    for _ in range(tries):
+        t, url = time.time(), page.url
+        await run.click(locator, what)
+
+        async def took(t=t, url=url):
+            return (page.url != url or any(ts >= t and expect(u) for ts, u in run.sent)
+                    or bool(shown and await shown.first.is_visible()))
+
+        if await wait_until(took, every):
+            return True
+        try:
+            if not await locator.is_visible() or not await locator.is_enabled(timeout=1000):
+                return True
+        except Exception:
+            return True
+        run.log(f"点「{what}」{every:g} 秒没反应（页面可能还没准备好），再点一次")
+    run.log(f"「{what}」点了 {tries} 次都没看到反应，接着等")
+    return False
 
 
 async def wait_shield(run):
@@ -233,9 +298,12 @@ async def prepare_bag(run, part):
 
 async def enter_checkout(run):
     page = run.page
-    await run.dump("bag")  # 这张不放后台：购物袋页刚打开，顺带给页面脚本一点时间接管「结账」按钮
-    await run.click(page.locator('[data-autom="checkout"]').first, "结账")
-    await page.wait_for_url(lambda u: "signIn" in u or "/checkout" in u, timeout=30000)
+    run.snap("bag")
+    # 购物袋页刚打开时页面脚本可能还没接管「结账」按钮，press 确认真点上了，没点上就再点
+    await press(run, page.locator('[data-autom="checkout"]').first, "结账",
+                lambda u: "/shop/bagx" in u or "/shop/checkout" in u)
+    # 不等整页加载完（图片、统计脚本），后面要点的按钮各自会等、会确认
+    await page.wait_for_url(lambda u: "signIn" in u or "/checkout" in u, wait_until="domcontentloaded", timeout=30000)
     if "signIn" in page.url:
         await run.dump("signin")
         await page.bring_to_front()
@@ -254,16 +322,20 @@ def step_of(url):
 
 async def click_continue(run, automs=()):
     page = run.page
+
+    def to_apple(u):
+        return "/shop/checkoutx" in u
+
     for _ in range(150):  # 新一步刚渲染时按钮可能还没出来，最多等 15 秒
         for a in (*automs, "continue-button", "continue-button-label", "continue-button-review"):
             b = page.locator(f'[data-autom="{a}"]')
             if await b.count() and await b.first.is_visible():
-                await run.click(b.first, a)
+                await press(run, b.first, a, to_apple, every=1, tries=3)
                 return
         await page.wait_for_timeout(100)
     b = page.get_by_role("button", name=re.compile("^继续"))
     if await b.count():
-        await run.click(b.first, "继续")
+        await press(run, b.first, "继续", to_apple, every=1, tries=3)
         return
     raise RuntimeError("找不到「继续」按钮")
 
@@ -308,7 +380,7 @@ STORE_STATES_JS = """() => [...document.querySelectorAll('input[type=radio]')].f
 def search_done(page, timeout=20000):
     """等「按位置查各店库存」的接口完整返回（实测约 10 秒）"""
     return asyncio.ensure_future(page.wait_for_event(
-        "requestfinished", predicate=lambda r: "storeLocator" in r.url and "_a=search" in r.url, timeout=timeout))
+        "requestfinished", predicate=lambda r: is_search(r.url), timeout=timeout))
 
 
 ANY_ENABLED_JS = """want => [...document.querySelectorAll('input[type=radio]')].some(e => want.includes(e.value) && !e.disabled)"""
@@ -365,8 +437,10 @@ async def open_pickup(run, want=(), dump=True):
     page = run.page
     # 点完会自动查一遍各店库存（实测约 10 秒），等它回来，列表里的可取货状态才准
     search = search_done(page, timeout=30000)
-    # 「我要取货」是 <button>，但 ARIA 角色不是 button，按角色找不到，按标签+文字找
-    await run.click(page.locator("button", has_text="我要取货").first, "我要取货")
+    # 「我要取货」是 <button>，但 ARIA 角色不是 button，按角色找不到，按标签+文字找。
+    # 刚进结账页时页面脚本可能还没接管按钮，press 确认查库存的请求发出去了，没发就再点
+    await press(run, page.locator("button", has_text="我要取货").first, "我要取货", is_search,
+                shown=page.locator('[data-autom="fulfillment-pickup-store-search-button"]'))
     try:
         await search
     except Exception:
@@ -454,8 +528,16 @@ async def do_contact(run):
             await inp.first.fill(val)
             filled.append(key)
     run.log(f"用 .env 补填：{filled or '无（页面上已有）'}")
-    empty = await page.locator("input[required]:visible").evaluate_all(
-        "es => es.filter(e => !e.value).map(e => (e.labels && e.labels[0] ? e.labels[0].innerText : e.name).trim())")
+    required = page.locator("input[required]:visible")
+    blanks = "es => es.filter(e => !e.value).map(e => (e.labels && e.labels[0] ? e.labels[0].innerText : e.name).trim())"
+    empty = await required.evaluate_all(blanks)
+    if empty:  # 账户里的信息可能还在往表单里填，稍等再判断，免得误报
+
+        async def all_filled():
+            return not await required.evaluate_all(blanks)
+
+        await wait_until(all_filled, 2)
+        empty = await required.evaluate_all(blanks)
     run.snap("contact")
     if empty:
         raise RuntimeError(f"还有必填项空着：{empty}，请在 .env 里补上对应信息")
@@ -501,11 +583,12 @@ async def checkout_steps(run, store_no):
         await page.wait_for_load_state("domcontentloaded")
         await run.settle()
         step = step_of(page.url) or "unknown"
+        run.mark(STEP_NAMES.get(step, step))
         run.snap(step)
         if seen.count(step) >= 2:
             raise RuntimeError(f"卡在「{step}」这一步没往下走")
         seen.append(step)
-        before = page.url
+        before, t = page.url, time.time()
         if step.startswith("Fulfillment"):
             await do_fulfillment(run, store_no)
         elif "Contact" in step:
@@ -519,21 +602,21 @@ async def checkout_steps(run, store_no):
                 run.log(f"已到最后一步，提交按钮：{await place.all_inner_texts()}。测试模式到此为止，没有提交订单")
                 return "review"
             await run.click(place.first, "立即下单")
+            run.mark("点了立即下单")
             try:  # 下单成功会离开 Review（去付款/订单确认页）；还停在 Review 多半是没货了或报错
                 await page.wait_for_url(lambda u: "_s=Review" not in u, timeout=120_000)
             except Exception:
                 await run.dump("place_failed")
                 return "failed"
+            run.mark("已下单")
             await page.wait_for_timeout(3000)
             await run.dump("placed")
             return "placed"
         else:
             run.log(f"没见过的步骤「{step}」，先停下")
             return
-        try:
-            await page.wait_for_url(lambda u: u != before, timeout=45000)
-        except Exception:
-            pass
+        if not await run.moved_on(before, t, 45):  # 被拒了就马上回到上面再看一眼这一步，第二次还不行就报卡住
+            run.log(f"「{step}」点了继续，接口都回来了还没往下走")
 
 
 def watch_checkout_api(run):
@@ -542,8 +625,9 @@ def watch_checkout_api(run):
     starts = {}
 
     def begin(r):
-        if r.resource_type in ("xhr", "fetch") and "/shop/" in r.url:
+        if is_api(r):
             run.inflight[r] = run.api_at = time.time()
+            run.sent.append((run.api_at, r.url))
         if "/shop/checkout" in r.url or "/shop/bagx" in r.url:
             starts[r] = time.time()
 
@@ -567,8 +651,10 @@ async def cmd_dryrun(part, store_no, until):
         run = Run(page, ctx, dry=True, until=until)
         watch_checkout_api(run)
         run.log(f"测试模式：{part} @ {store_no} {STORES.get(store_no, '')}，走到 {until} 为止（不会提交订单）")
+        run.t_hit = time.time()
         try:
             await prepare_bag(run, part)
+            run.mark("购物袋")
             await enter_checkout(run)
             await checkout_steps(run, store_no)
         except Stop as s:
@@ -577,6 +663,7 @@ async def cmd_dryrun(part, store_no, until):
             run.log("出错：\n" + traceback.format_exc())
             await run.dump("error")
         await run.flush()
+        run.log(f"各步耗时：{run.timeline()}")
         run.log(f"结束，记录在 {run.dir}")
         try:
             await asyncio.get_running_loop().run_in_executor(None, input, "看完按回车关闭浏览器…")
@@ -594,9 +681,10 @@ async def position(run, part, want=()):
     await prepare_bag(run, part)
     run.bag_part = part
     await enter_checkout(run)
-    await run.page.wait_for_timeout(1500)
-    if step_of(run.page.url) != "Fulfillment":
-        raise RuntimeError(f"结账页不是取货那一步：{run.page.url}")
+    try:  # 等跳到取货这一步就走（中间可能还转一下），不再固定等 1.5 秒；点「我要取货」时 press 会确认点上了
+        await run.page.wait_for_url(lambda u: step_of(u) == "Fulfillment", wait_until="domcontentloaded", timeout=20000)
+    except Exception:
+        raise RuntimeError(f"结账页不是取货那一步：{run.page.url}") from None
     states = await open_pickup(run, want)
     run.log(f"已站位（购物袋里是 {pname(part)}）：停在取货门店列表，等监控报有货")
     return states
@@ -605,9 +693,9 @@ async def position(run, part, want=()):
 async def attempt(run, stores, hits):
     """收到有货 hits=[(门店, 型号), ...]：先抢购物袋里现成的型号（只需刷新，约 10 秒），
     不是的话换型号重新站位（约 25 秒）；某个型号刷新后没了就试下一个。返回 (结果, 型号)，
-    结果是 placed / review / failed / gone"""
+    结果是 placed / review / failed / gone。各步耗时记在 run.marks"""
     page = run.page
-    t0 = time.time()
+    run.t_hit, run.marks, run.pick = time.time(), [], None
     parts = list(dict.fromkeys(p for _, p in hits))
     parts.sort(key=lambda p: p != run.bag_part)  # 购物袋里现成的排最前
     for part in parts:
@@ -615,16 +703,23 @@ async def attempt(run, stores, hits):
             states = await refresh_pickup(run, stores)
         else:  # 换型号，或者结账会话过期了（跳到 session_expired 页）
             run.log(f"换成 {pname(part)} 重新站位")
+            run.mark(f"换成{pname(part)}")
             states = await position(run, part, stores)
+        run.mark("门店列表")
         enabled = [s for s, _, disabled, _ in states if not disabled and s in stores]
         pick = next((s for s, p in hits if p == part and s in enabled), enabled[0] if enabled else None)
         if not pick:
             run.log(f"{pname(part)} 刷新后这几家店都没货了，慢了一步")
             continue
-        run.log(f"抢 {pname(part)} @ {pick} {STORES.get(pick, '')}（开抢后 {time.time() - t0:.1f}s 门店列表就绪）")
-        before = page.url
+        run.pick = pick
+        run.log(f"抢 {pname(part)} @ {pick} {STORES.get(pick, '')}（开抢后 {time.time() - run.t_hit:.1f}s 门店列表就绪）")
+        before, t = page.url, time.time()
         await finish_fulfillment(run, pick)
-        await page.wait_for_url(lambda u: u != before, timeout=60_000)  # 这一步 Apple 要十几秒
+        run.mark("选好店")
+        if not await run.moved_on(before, t, 60):  # 这一步 Apple 要十几秒
+            run.log("选好店点了继续，接口回来了还停在取货这一步：多半是这家店刚被别人抢走，或者页面报错了")
+            run.snap("fulfillment_stuck")
+            return "failed", part
         return (await checkout_steps(run, pick) or "failed"), part
     return "gone", None
 
@@ -634,6 +729,31 @@ def read_trigger():
         return json.loads(TRIGGER.read_text())
     except Exception:
         return None
+
+
+def record_attempt(**kw):
+    """每次抢购的结果和各步耗时追加到 attempts.jsonl，stats.py 汇总"""
+    with ATTEMPTS.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": datetime.now().isoformat(timespec="seconds"), **kw}, ensure_ascii=False) + "\n")
+
+
+def most_restocked(cands, days=7):
+    """events.jsonl 里最近 days 天 cands 中补货次数最多的型号，返回 (型号, 次数, 总次数)；没记录返回 None"""
+    if not EVENTS.exists():
+        return None
+    since = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+    n = collections.Counter()
+    for line in EVENTS.read_text(encoding="utf-8").splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("event") == "in_stock" and e.get("ts", "") >= since and e.get("part") in cands:
+            n[e["part"]] += 1
+    if not n:
+        return None
+    part, cnt = n.most_common(1)[0]
+    return part, cnt, sum(n.values())
 
 
 async def cmd_serve(parts, prefer, stores, live, selftest):
@@ -662,6 +782,38 @@ async def cmd_serve(parts, prefer, stores, live, selftest):
         want = "iPhone Duo 全部规格" if parts is None else "、".join(pname(p) for p in parts)
         run.log(f"常驻{'【正式，会真下单】' if live else '【演练，停在立即下单前】'}：{want}，"
                 f"站位放 {pname(prefer)}，门店 {stores}")
+
+        async def grab(hits):
+            """抢一次，返回 (结果, 型号, 出错信息)；出错不往外抛，结果记成 error"""
+            try:
+                result, part = await attempt(run, stores, hits)
+                return result, part, None
+            except Exception:
+                run.log("出错：\n" + traceback.format_exc())
+                await run.dump("error")
+                return "error", None, traceback.format_exc().splitlines()[-1][:150]
+
+        def report(hits, age, result, part, err, again, retrying):
+            """抢完不管成没成都推送一条：结果、各步耗时、卡在哪，同时记进 attempts.jsonl"""
+            line = run.timeline()
+            run.log(f"结果：{result}（{line}）" + (f"，{err}" if err else ""))
+            record_attempt(live=live, signal_age=round(age, 1), hits=hits, retry=retrying, result=result,
+                           part=part, store=run.pick, marks=run.marks, error=err)
+            where = STORES.get(run.pick, "")
+            if result == "placed":
+                notify("🎉 已下单！马上去付款",
+                       f"iPhone Duo {pname(part)} @ {where} 已提交订单，请尽快在窗口或 Apple Store App 订单里用"
+                       f"{os.environ.get('ORDER_PAYMENT')}付款（{line}）", page.url, urgent=True)
+            elif result == "review":
+                notify("演练：已走到立即下单前", f"{pname(part)} @ {where}：{line}（演练没有下单）")
+            elif result == "gone":
+                what = "、".join(f"{STORES.get(s, s)}·{pname(p)}" for s, p in hits)
+                notify("😢 慢了一步", f"{what}：信号是 {age:.0f}s 前的，刷新门店列表时已经没货了（{line}）")
+            else:
+                stuck = run.marks[-1][0] if run.marks else "开头"
+                notify("⚠️ 没抢成", f"{pname(part or hits[0][1])}：卡在「{stuck}」{'，' + err if err else ''}（{line}）"
+                       + ("，信号还新鲜，马上再试一次" if again else ""))
+
         last_ts, positioned, next_refresh, placed = time.time(), False, 0.0, False
         pending, is_selftest = None, bool(selftest)
         while True:
@@ -677,23 +829,26 @@ async def cmd_serve(parts, prefer, stores, live, selftest):
                     hits = [(s, p) for s, p in trig.get("avail", [])
                             if s in stores and (p in parts if parts else p in PART_NAMES)]
                     if hits and time.time() - last_ts < 120:
-                        run.log(f"监控报有货：{[(s, pname(p)) for s, p in hits]}（信号是 {time.time() - last_ts:.1f}s 前的），开抢")
-                        t0 = time.time()
-                        result, part = await attempt(run, stores, hits)
-                        run.log(f"结果：{result}（开抢后 {time.time() - t0:.1f}s）")
-                        if result == "placed":
+                        age, retrying = time.time() - last_ts, bool(trig.get("retry"))
+                        run.log(f"监控报有货：{[(s, pname(p)) for s, p in hits]}（信号是 {age:.1f}s 前的），"
+                                + ("上次没抢成，再试一次" if retrying else "开抢"))
+                        result, part, err = await grab(hits)
+                        if result == "placed":  # 先写锁再通知，保证只下一单
                             LOCK.write_text(f"{datetime.now():%F %T} {part} {page.url}\n")
-                            notify("🎉 已下单！马上去付款",
-                                   f"iPhone Duo {pname(part)} 已提交订单，请尽快在窗口或 Apple Store App 订单里用"
-                                   f"{os.environ.get('ORDER_PAYMENT')}付款", page.url, urgent=True)
+                        # 没抢成（不算「慢了一步」，那是真没货了）而信号还新鲜，就马上再试一次，只重试一次
+                        again = result in ("failed", "error") and not retrying and time.time() - last_ts < 90
+                        report(hits, age, result, part, err, again, retrying)
+                        if result == "placed":
                             placed = True
                             break
-                        if result == "review":
-                            notify("演练：已走到立即下单前", f"{pname(part)} 有货时的整套流程走通了（演练没有下单）")
+                        if again:  # 不用先回首选型号站位，attempt 自己会按要抢的型号刷新或重新站位
+                            pending, last_ts = dict(trig, retry=True), last_ts - 0.001
+                            continue
                         if is_selftest:
                             break
-                        # 购物袋换成了别的型号、或已离开取货页，都回到首选型号重新站位
-                        positioned = step_of(page.url) == "Fulfillment" and run.bag_part == prefer
+                        # 购物袋换成了别的型号、离开了取货页、或者出过错，都回到首选型号重新站位
+                        positioned = (result not in ("failed", "error") and step_of(page.url) == "Fulfillment"
+                                      and run.bag_part == prefer)
                         continue
                 if time.time() > next_refresh:  # 赶在结账会话过期前重新站位
                     positioned = False
@@ -739,8 +894,8 @@ def main():
                    help="走到哪一步停：bag=加完购物袋，pickup=打开取货门店列表，location=再强制把位置设成北京，review=检查订单页（默认）")
     s = sub.add_parser("serve", help="常驻：站好位等监控报有货，有货就抢（不加 --live 只演练）")
     s.add_argument("--parts", default="ALL", help="接受的型号，逗号分隔；默认 ALL = iPhone Duo 全部 8 个规格，哪个有货抢哪个")
-    s.add_argument("--prefer", help=f"站位时购物袋里放的型号，默认 {DEFAULT_PREFER}（{PART_NAMES[DEFAULT_PREFER]}，补货最多）；"
-                                    "指定了 --parts 就默认用其中第一个")
+    s.add_argument("--prefer", help="站位时购物袋里放的型号；默认按 events.jsonl 挑最近 7 天补货最多的（只在 --parts 里挑）；"
+                                    f"没记录时用 --parts 的第一个，没给 --parts 用 {DEFAULT_PREFER}（{PART_NAMES[DEFAULT_PREFER]}）")
     s.add_argument("--stores", default=",".join(STORES), help="接受的门店编号，逗号分隔，默认北京 6 家")
     s.add_argument("--live", action="store_true", help="正式模式：真的点「立即下单」")
     s.add_argument("--selftest", choices=sorted(STORES), help="演练自测：站好位后假装这家店有货，走一遍就退出")
@@ -756,7 +911,14 @@ def main():
         if bad := [x for x in stores if x not in STORES]:
             ap.error(f"不认识的门店编号：{bad}")
         parts = None if args.parts.upper() == "ALL" else [x.strip().upper() for x in args.parts.split(",") if x.strip()]
-        prefer = (args.prefer or (parts[0] if parts else DEFAULT_PREFER)).upper()
+        cands = parts or list(PART_NAMES)
+        if args.prefer:
+            prefer = args.prefer.upper()
+        elif best := most_restocked(cands):  # 有货的型号正好在购物袋里只要刷新，换型号要多花十几秒
+            prefer = best[0]
+            print(f"站位放 {pname(prefer)}：最近 7 天补货 {best[1]}/{best[2]} 次，最多（按 events.jsonl 挑的，可用 --prefer 指定）")
+        else:
+            prefer = parts[0] if parts else DEFAULT_PREFER
         if parts and prefer not in parts:
             ap.error("--prefer 必须是 --parts 里的一个")
         asyncio.run(cmd_serve(parts, prefer, stores, args.live, args.selftest))

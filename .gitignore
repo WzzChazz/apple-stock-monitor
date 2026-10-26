@@ -10,6 +10,7 @@ _backup/
 # 运行时文件
 *.log
 events.jsonl
+attempts.jsonl
 trigger.json
 trigger.tmp
 monitor.pid
