@@ -20,7 +20,7 @@
     WX_TEMPLATE_ID          新增的模板消息 ID，模板内容填：{{title.DATA}} {{content.DATA}}
   BARK_KEY=xxx              iOS Bark App 的 key（或完整推送地址）
 
-库存变化记录在同目录 events.jsonl，可以用来摸补货规律；发现新货时写 trigger.json 给 autoorder.py serve。
+库存变化记录在同目录 events.jsonl，可以用来摸补货规律（python3 stats.py 汇总）；发现新货时写 trigger.json 给 autoorder.py serve。
 """
 import argparse
 import collections
